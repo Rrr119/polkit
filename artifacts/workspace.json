@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid34519",
+  "B": "/home/dev/feedback/uid34519",
+  "sha": "150dc03aef23c99090d9b7e9c1df02a8feb0ff4a",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "polkit-org",
+    "repo": "polkit",
+    "sha": "150dc03aef23c99090d9b7e9c1df02a8feb0ff4a"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "polkit",
+    "cloneUrl": "https://github.com/Rrr119/polkit.git"
+  },
+  "at": "2026-11-22T21:08:40.400Z"
+}

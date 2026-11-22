@@ -28,6 +28,7 @@
 
 #include <polkit/polkit.h>
 #include <polkitbackend/polkitbackendjsauthority.h>
+#include <polkitbackend/polkitbackendsessionmonitor.h>
 #include <polkittesthelper.h>
 
 /* see test/data/etc/polkit-1/rules.d/10-testing.rules */
@@ -156,6 +157,152 @@ test_get_admin_identities (void)
 
 /* ---------------------------------------------------------------------------------------------------- */
 
+static void
+test_get_admin_identities_for_session_subject (void)
+{
+  const gchar *expected_admins[] = { "unix-group:admin", "unix-user:root", NULL };
+  const gchar *action_id = "net.company.action_for_session_subject";
+  PolkitBackendJsAuthority *authority;
+  PolkitBackendInteractiveAuthority *interactive_authority;
+  PolkitSubject *caller;
+  PolkitSubject *subject;
+  PolkitIdentity *user_for_subject;
+  PolkitDetails *details;
+  GError *error = NULL;
+  GList *admin_identities;
+  GList *l;
+  guint n;
+
+  authority = get_authority ();
+  interactive_authority = POLKIT_BACKEND_INTERACTIVE_AUTHORITY (authority);
+  caller = polkit_unix_process_new_for_owner (getpid (), 0, getuid ());
+  subject = polkit_unix_session_new ("c1");
+  user_for_subject = polkit_identity_from_string ("unix-user:john", &error);
+  g_assert_no_error (error);
+  details = polkit_details_new ();
+
+  admin_identities = polkit_backend_interactive_authority_get_admin_identities (interactive_authority,
+                                                                                caller,
+                                                                                subject,
+                                                                                user_for_subject,
+                                                                                TRUE,
+                                                                                TRUE,
+                                                                                action_id,
+                                                                                details);
+  for (l = admin_identities, n = 0; l != NULL; l = l->next, n++)
+    {
+      gchar *identity = polkit_identity_to_string (l->data);
+
+      g_assert (expected_admins[n] != NULL);
+      g_assert_cmpstr (expected_admins[n], ==, identity);
+      g_free (identity);
+    }
+  g_assert_cmpstr (expected_admins[n], ==, NULL);
+
+  g_list_free_full (admin_identities, g_object_unref);
+  g_object_unref (details);
+  g_object_unref (user_for_subject);
+  g_object_unref (subject);
+  g_object_unref (caller);
+  g_object_unref (authority);
+}
+
+/* ---------------------------------------------------------------------------------------------------- */
+
+static void
+test_session_monitor_get_session_for_session_subject (void)
+{
+  PolkitBackendSessionMonitor *monitor;
+  PolkitSubject *subject;
+  PolkitSubject *session;
+
+  monitor = polkit_backend_session_monitor_new ();
+  g_assert (monitor != NULL);
+
+  subject = polkit_unix_session_new ("c1");
+  session = polkit_backend_session_monitor_get_session_for_subject (monitor, subject, NULL);
+  g_assert (session != NULL);
+  g_assert_true (POLKIT_IS_UNIX_SESSION (session));
+  g_assert_cmpstr (polkit_unix_session_get_session_id (POLKIT_UNIX_SESSION (session)), ==, "c1");
+
+  g_object_unref (session);
+  g_object_unref (subject);
+  g_object_unref (monitor);
+}
+
+/* ---------------------------------------------------------------------------------------------------- */
+
+static void
+test_invalid_session_subject_is_rejected (void)
+{
+  PolkitBackendJsAuthority *authority;
+  PolkitBackendInteractiveAuthority *interactive_authority;
+  const gchar *action_id = "net.company.desktop.session_user_policy";
+  PolkitSubject *caller;
+  PolkitSubject *subject;
+  PolkitIdentity *user_for_subject;
+  PolkitDetails *details;
+  PolkitImplicitAuthorization result;
+  PolkitImplicitAuthorization implicit;
+  GList *admins;
+
+  authority = get_authority ();
+  interactive_authority = POLKIT_BACKEND_INTERACTIVE_AUTHORITY (authority);
+  caller = polkit_unix_process_new_for_owner (getpid (), 0, getuid ());
+  user_for_subject = polkit_unix_user_new (500);
+  details = polkit_details_new ();
+  implicit = POLKIT_IMPLICIT_AUTHORIZATION_AUTHORIZED;
+
+  subject = polkit_unix_session_new ("");
+  result = polkit_backend_interactive_authority_check_authorization_sync (interactive_authority,
+                                                                          caller,
+                                                                          subject,
+                                                                          user_for_subject,
+                                                                          TRUE,
+                                                                          TRUE,
+                                                                          action_id,
+                                                                          details,
+                                                                          implicit);
+  g_assert_cmpint (result, ==, POLKIT_IMPLICIT_AUTHORIZATION_NOT_AUTHORIZED);
+
+  admins = polkit_backend_interactive_authority_get_admin_identities (interactive_authority,
+                                                                      caller,
+                                                                      subject,
+                                                                      user_for_subject,
+                                                                      TRUE,
+                                                                      TRUE,
+                                                                      "net.company.action1",
+                                                                      details);
+  g_assert_cmpuint (g_list_length (admins), ==, 1);
+  g_assert_true (POLKIT_IS_UNIX_USER (admins->data));
+  g_assert_cmpuint (polkit_unix_user_get_uid (admins->data), ==, 0);
+  g_list_free_full (admins, g_object_unref);
+  g_object_unref (subject);
+
+  /* A rejected session subject must not poison the authority: process
+   * subjects still evaluate rules normally afterwards. */
+  subject = polkit_unix_process_new_for_owner (getpid (), 0, getuid ());
+  implicit = POLKIT_IMPLICIT_AUTHORIZATION_UNKNOWN;
+  result = polkit_backend_interactive_authority_check_authorization_sync (interactive_authority,
+                                                                          caller,
+                                                                          subject,
+                                                                          user_for_subject,
+                                                                          TRUE,
+                                                                          TRUE,
+                                                                          action_id,
+                                                                          details,
+                                                                          implicit);
+  g_assert_cmpint (result, ==, POLKIT_IMPLICIT_AUTHORIZATION_AUTHORIZED);
+
+  g_object_unref (subject);
+  g_object_unref (details);
+  g_object_unref (user_for_subject);
+  g_object_unref (caller);
+  g_object_unref (authority);
+}
+
+/* ---------------------------------------------------------------------------------------------------- */
+
 typedef struct RulesTestCase RulesTestCase;
 
 struct RulesTestCase
@@ -165,6 +312,9 @@ struct RulesTestCase
   const gchar *identity;
   const gchar *vars;
   PolkitImplicitAuthorization expected_result;
+  const gchar *subject_session_id;
+  gboolean subject_is_local;
+  gboolean subject_is_active;
 };
 
 static const RulesTestCase rules_test_cases[] = {
@@ -423,6 +573,109 @@ static const RulesTestCase rules_test_cases[] = {
     NULL,
     POLKIT_IMPLICIT_AUTHORIZATION_NOT_AUTHORIZED,
   },
+
+  /* desktop session and user policy; see the matching rule in
+   * test/data/etc/polkit-1/rules.d/10-testing.rules */
+  {
+    "desktop_session_user_match",
+    "net.company.desktop.session_user_policy",
+    "unix-user:john",
+    "session=c1;user=john;local=1;active=1",
+    POLKIT_IMPLICIT_AUTHORIZATION_AUTHORIZED,
+    "c1",
+    TRUE,
+    TRUE,
+  },
+  {
+    "desktop_session_user_wrong_session",
+    "net.company.desktop.session_user_policy",
+    "unix-user:john",
+    "session=c2;user=john;local=1;active=1",
+    POLKIT_IMPLICIT_AUTHORIZATION_NOT_AUTHORIZED,
+    "c1",
+    TRUE,
+    TRUE,
+  },
+  {
+    "desktop_session_user_wrong_user",
+    "net.company.desktop.session_user_policy",
+    "unix-user:john",
+    "session=c1;user=jane;local=1;active=1",
+    POLKIT_IMPLICIT_AUTHORIZATION_NOT_AUTHORIZED,
+    "c1",
+    TRUE,
+    TRUE,
+  },
+  {
+    "desktop_session_user_local_required",
+    "net.company.desktop.session_user_policy",
+    "unix-user:john",
+    "session=c1;user=john;local=1;active=1",
+    POLKIT_IMPLICIT_AUTHORIZATION_NOT_AUTHORIZED,
+    "c1",
+    FALSE,
+    TRUE,
+  },
+  {
+    "desktop_session_user_active_required",
+    "net.company.desktop.session_user_policy",
+    "unix-user:john",
+    "session=c1;user=john;local=1;active=1",
+    POLKIT_IMPLICIT_AUTHORIZATION_NOT_AUTHORIZED,
+    "c1",
+    TRUE,
+    FALSE,
+  },
+  {
+    "desktop_session_user_group_member",
+    "net.company.desktop.session_user_policy",
+    "unix-user:john",
+    "session=c1;user=john;group=users",
+    POLKIT_IMPLICIT_AUTHORIZATION_AUTHORIZED,
+    "c1",
+    TRUE,
+    TRUE,
+  },
+  {
+    "desktop_session_user_group_non_member",
+    "net.company.desktop.session_user_policy",
+    "unix-user:john",
+    "session=c1;user=john;group=admin",
+    POLKIT_IMPLICIT_AUTHORIZATION_NOT_AUTHORIZED,
+    "c1",
+    TRUE,
+    TRUE,
+  },
+  {
+    "desktop_session_has_no_pid",
+    "net.company.desktop.session_user_policy",
+    "unix-user:john",
+    "session=c1;user=john;no_pid=1",
+    POLKIT_IMPLICIT_AUTHORIZATION_AUTHORIZED,
+    "c1",
+    TRUE,
+    TRUE,
+  },
+  {
+    "desktop_process_policy_has_pid",
+    "net.company.desktop.session_user_policy",
+    "unix-user:john",
+    "user=john;no_pid=1",
+    POLKIT_IMPLICIT_AUTHORIZATION_NOT_AUTHORIZED,
+    NULL,
+    FALSE,
+    FALSE,
+  },
+  {
+    "desktop_session_user_no_location_requirements",
+    "net.company.desktop.session_user_policy",
+    "unix-user:john",
+    "session=c1;user=john",
+    POLKIT_IMPLICIT_AUTHORIZATION_AUTHORIZED,
+    "c1",
+    FALSE,
+    FALSE,
+  },
 };
 
 /* ---------------------------------------------------------------------------------------------------- */
@@ -432,17 +685,33 @@ rules_test_func (gconstpointer user_data)
 {
   const RulesTestCase *tc = user_data;
   PolkitBackendJsAuthority *authority = NULL;
+  PolkitBackendInteractiveAuthority *interactive_authority = NULL;
   PolkitSubject *caller = NULL;
   PolkitSubject *subject = NULL;
   PolkitIdentity *user_for_subject = NULL;
   PolkitDetails *details = NULL;
   GError *error = NULL;
   PolkitImplicitAuthorization result;
+  PolkitImplicitAuthorization implicit = POLKIT_IMPLICIT_AUTHORIZATION_UNKNOWN;
+  gboolean subject_is_local;
+  gboolean subject_is_active;
 
   authority = get_authority ();
+  interactive_authority = POLKIT_BACKEND_INTERACTIVE_AUTHORITY (authority);
 
   caller = polkit_unix_process_new_for_owner (getpid (), 0, getuid ());
-  subject = polkit_unix_process_new_for_owner (getpid (), 0, getuid ());
+  if (tc->subject_session_id != NULL)
+    {
+      subject = polkit_unix_session_new (tc->subject_session_id);
+      subject_is_local = tc->subject_is_local;
+      subject_is_active = tc->subject_is_active;
+    }
+  else
+    {
+      subject = polkit_unix_process_new_for_owner (getpid (), 0, getuid ());
+      subject_is_local = TRUE;
+      subject_is_active = TRUE;
+    }
   user_for_subject = polkit_identity_from_string (tc->identity, &error);
   g_assert_no_error (error);
 
@@ -450,30 +719,34 @@ rules_test_func (gconstpointer user_data)
 
   if (tc->vars != NULL)
     {
-      gchar *s;
-      const gchar *key;
-      const gchar *value;
+      gchar **vars;
+      guint n;
 
-      s = g_strdup (tc->vars);
-      key = s;
-      value = strchr (key, '=');
-      g_assert (value != NULL);
-      *((gchar *) value) = '\0';
-      value += 1;
+      vars = g_strsplit (tc->vars, ";", -1);
+      for (n = 0; vars[n] != NULL; n++)
+        {
+          gchar *value;
 
-      polkit_details_insert (details, key, value);
-      g_free (s);
+          if (vars[n][0] == '\0')
+            continue;
+
+          value = strchr (vars[n], '=');
+          g_assert (value != NULL);
+          *value = '\0';
+          polkit_details_insert (details, vars[n], value + 1);
+        }
+      g_strfreev (vars);
     }
 
-  result = polkit_backend_interactive_authority_check_authorization_sync (POLKIT_BACKEND_INTERACTIVE_AUTHORITY (authority),
+  result = polkit_backend_interactive_authority_check_authorization_sync (interactive_authority,
                                                                           caller,
                                                                           subject,
                                                                           user_for_subject,
-                                                                          TRUE,
-                                                                          TRUE,
+                                                                          subject_is_local,
+                                                                          subject_is_active,
                                                                           tc->action_id,
                                                                           details,
-                                                                          POLKIT_IMPLICIT_AUTHORIZATION_UNKNOWN);
+                                                                          implicit);
   g_assert_cmpint (result, ==, tc->expected_result);
 
   g_clear_object (&details);
@@ -508,6 +781,12 @@ main (int argc, char *argv[])
   //polkit_test_redirect_logs ();
 
   g_test_add_func ("/PolkitBackendJsAuthority/get_admin_identities", test_get_admin_identities);
+  g_test_add_func ("/PolkitBackendJsAuthority/get_admin_identities_for_session_subject",
+                   test_get_admin_identities_for_session_subject);
+  g_test_add_func ("/PolkitBackendSessionMonitor/get_session_for_session_subject",
+                   test_session_monitor_get_session_for_session_subject);
+  g_test_add_func ("/PolkitBackendJsAuthority/invalid_session_subject_is_rejected",
+                   test_invalid_session_subject_is_rejected);
   add_rules_tests ();
 
   return g_test_run ();

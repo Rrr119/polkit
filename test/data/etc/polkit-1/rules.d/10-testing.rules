@@ -124,6 +124,32 @@ polkit.addRule(function(action, subject) {
 });
 
 // ---------------------------------------------------------------------
+// desktop session and user policy
+
+polkit.addRule(function(action, subject) {
+    if (action.id == "net.company.desktop.session_user_policy") {
+        var session = action.lookup("session");
+        var user = action.lookup("user");
+        var group = action.lookup("group");
+
+        if (session && subject.session != session)
+            return polkit.Result.NO;
+        if (user && subject.user != user)
+            return polkit.Result.NO;
+        if (action.lookup("local") == "1" && !subject.local)
+            return polkit.Result.NO;
+        if (action.lookup("active") == "1" && !subject.active)
+            return polkit.Result.NO;
+        if (group && !subject.isInGroup(group))
+            return polkit.Result.NO;
+        if (action.lookup("no_pid") == "1" && typeof subject.pid != "undefined")
+            return polkit.Result.NO;
+
+        return polkit.Result.YES;
+    }
+});
+
+// ---------------------------------------------------------------------
 // spawning
 
 polkit.addRule(function(action, subject) {

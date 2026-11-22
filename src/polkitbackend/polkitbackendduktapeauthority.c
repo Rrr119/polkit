@@ -380,7 +380,8 @@ push_subject (duk_context               *cx,
   gboolean ret = FALSE;
   gboolean no_new_privs = FALSE;
   gint pidfd = -1;
-  pid_t pid_early, pid_late;
+  pid_t pid_early = 0;
+  pid_t pid_late = 0;
   uid_t uid;
   PolkitSubject *process = NULL;
   gchar *user_name = NULL;
@@ -390,14 +391,27 @@ push_subject (duk_context               *cx,
   char *seat_str = NULL;
   char *session_str = NULL;
   char *system_unit = NULL;
+  const gchar *subject_session_id = NULL;
 
-  if (!duk_get_global_string (cx, "Subject")) {
-    return FALSE;
-  }
+  if (POLKIT_IS_UNIX_SESSION (subject))
+    {
+      /* A session has no process of its own. Use the session id from the
+       * subject directly and leave process-specific properties unset. */
+      subject_session_id = polkit_unix_session_get_session_id (POLKIT_UNIX_SESSION (subject));
+      if (subject_session_id == NULL || subject_session_id[0] == '\0')
+        {
+          g_set_error (error,
+                       POLKIT_ERROR,
+                       POLKIT_ERROR_FAILED,
+                       "Session subject has no session id");
+          goto out;
+        }
 
-  duk_new (cx, 0);
-
-  if (POLKIT_IS_UNIX_PROCESS (subject))
+#ifdef HAVE_LIBSYSTEMD
+      sd_session_get_seat (subject_session_id, &seat_str);
+#endif /* HAVE_LIBSYSTEMD */
+    }
+  else if (POLKIT_IS_UNIX_PROCESS (subject))
     {
       process = subject;
     }
@@ -409,39 +423,55 @@ push_subject (duk_context               *cx,
     }
   else
     {
-      g_assert_not_reached ();
+      g_set_error (error,
+                   POLKIT_ERROR,
+                   POLKIT_ERROR_NOT_SUPPORTED,
+                   "Cannot convert subject of type %s to JS object",
+                   G_OBJECT_TYPE_NAME (subject));
+      goto out;
     }
 
-  pid_early = polkit_unix_process_get_pid (POLKIT_UNIX_PROCESS (process));
-  pidfd = polkit_unix_process_get_pidfd (POLKIT_UNIX_PROCESS (process));
+  if (process != NULL)
+    {
+      pid_early = polkit_unix_process_get_pid (POLKIT_UNIX_PROCESS (process));
+      pidfd = polkit_unix_process_get_pidfd (POLKIT_UNIX_PROCESS (process));
 
 #ifdef HAVE_LIBSYSTEMD
 #if HAVE_SD_PIDFD_GET_SESSION
-  if (pidfd >= 0)
-    sd_pidfd_get_session (pidfd, &session_str);
-  else
+      if (pidfd >= 0)
+        sd_pidfd_get_session (pidfd, &session_str);
+      else
 #endif /* HAVE_SD_PIDFD_GET_SESSION */
-    sd_pid_get_session (pid_early, &session_str);
-  if (session_str)
-    sd_session_get_seat (session_str, &seat_str);
+        sd_pid_get_session (pid_early, &session_str);
+      if (session_str)
+        sd_session_get_seat (session_str, &seat_str);
 #endif /* HAVE_LIBSYSTEMD */
+    }
 
-  g_assert (POLKIT_IS_UNIX_USER (user_for_subject));
+  if (!POLKIT_IS_UNIX_USER (user_for_subject))
+    {
+      g_set_error (error,
+                   POLKIT_ERROR,
+                   POLKIT_ERROR_FAILED,
+                   "user_for_subject is not a unix user");
+      goto out;
+    }
   uid = polkit_unix_user_get_uid (POLKIT_UNIX_USER (user_for_subject));
 
   groups = g_ptr_array_new_with_free_func (g_free);
-  gids_from_dbus = polkit_unix_process_get_gids (POLKIT_UNIX_PROCESS (process));
+  if (process != NULL)
+    gids_from_dbus = polkit_unix_process_get_gids (POLKIT_UNIX_PROCESS (process));
 
-passwd = getpwuid (uid);
-if (passwd == NULL)
-  {
-    user_name = g_strdup_printf ("%d", (gint) uid);
-    g_warning ("Error looking up info for uid %d", (gint) uid);
-  }
-else
-  {
-    user_name = g_strdup (passwd->pw_name);
-  }
+  passwd = getpwuid (uid);
+  if (passwd == NULL)
+    {
+      user_name = g_strdup_printf ("%d", (gint) uid);
+      g_warning ("Error looking up info for uid %d", (gint) uid);
+    }
+  else
+    {
+      user_name = g_strdup (passwd->pw_name);
+    }
 
   /* D-Bus will give us supplementary groups too, so prefer that to looking up
    * the group from the uid. */
@@ -500,40 +530,55 @@ else
    * Best-effort operation, will log on failure, but we don't bail here. But
    * only do so if the pidfd was marked as safe, i.e.: we got it from D-Bus so
    * it can be trusted end-to-end, with no reuse attack window.  */
-  if (polkit_unix_process_get_pidfd_is_safe (POLKIT_UNIX_PROCESS (process)))
-    polkit_backend_common_pidfd_to_systemd_unit (pidfd, &system_unit, &no_new_privs);
-
-  /* In case we are using PIDFDs, check that the PID still matches to avoid race
-   * conditions and PID recycle attacks.
-   */
-  pid_late = polkit_unix_process_get_pid (POLKIT_UNIX_PROCESS (process));
-  if (pid_late != pid_early)
+  if (process != NULL)
     {
-      if (pid_late <= 0)
+      if (polkit_unix_process_get_pidfd_is_safe (POLKIT_UNIX_PROCESS (process)))
+        polkit_backend_common_pidfd_to_systemd_unit (pidfd, &system_unit, &no_new_privs);
+
+      /* In case we are using PIDFDs, check that the PID still matches to avoid race
+       * conditions and PID recycle attacks.
+       */
+      pid_late = polkit_unix_process_get_pid (POLKIT_UNIX_PROCESS (process));
+      if (pid_late != pid_early)
         {
-          g_warning ("Process %d terminated", (gint) pid_early);
-          g_set_error (error,
-                       POLKIT_ERROR,
-                       POLKIT_ERROR_FAILED,
-                       "Process %d terminated", (gint) pid_early);
+          if (pid_late <= 0)
+            {
+              g_warning ("Process %d terminated", (gint) pid_early);
+              g_set_error (error,
+                           POLKIT_ERROR,
+                           POLKIT_ERROR_FAILED,
+                           "Process %d terminated", (gint) pid_early);
+            }
+          else
+            {
+              g_warning ("Process changed pid from %d to %d", (gint) pid_early, (gint) pid_late);
+              g_set_error (error,
+                           POLKIT_ERROR,
+                           POLKIT_ERROR_FAILED,
+                           "Process changed pid from %d to %d", (gint) pid_early, (gint) pid_late);
+            }
+          goto out;
         }
-      else
-      {
-        g_warning ("Process changed pid from %d to %d", (gint) pid_early, (gint) pid_late);
-        g_set_error (error,
-                     POLKIT_ERROR,
-                     POLKIT_ERROR_FAILED,
-                     "Process changed pid from %d to %d", (gint) pid_early, (gint) pid_late);
-      }
+    }
+
+  if (!duk_get_global_string (cx, "Subject"))
+    {
+      g_set_error (error,
+                   POLKIT_ERROR,
+                   POLKIT_ERROR_FAILED,
+                   "Cannot find Subject constructor in JS context");
       goto out;
     }
 
+  duk_new (cx, 0);
+
   set_property_int32 (cx, "uid", uid);
-  set_property_int32 (cx, "pid", pid_early);
+  if (process != NULL)
+    set_property_int32 (cx, "pid", pid_early);
   set_property_str (cx, "user", user_name);
   set_property_strv (cx, "groups", groups);
   set_property_str (cx, "seat", seat_str);
-  set_property_str (cx, "session", session_str);
+  set_property_str (cx, "session", subject_session_id != NULL ? subject_session_id : session_str);
   set_property_str (cx, "system_unit", system_unit);
   /* If we have a unit, also record if it has the NoNewPrivileges setting enabled */
   if (system_unit)
